@@ -1,40 +1,53 @@
+# script_util.py
+
 import argparse
+import numpy as np
 
 from .karras_diffusion import KarrasDenoiser
-from .edm_unet import SongUNet
 from .nafunet import NAFUNetModel
-import numpy as np
 
 NUM_CLASSES = 1000
 
-
 def get_workdir(exp):
-    workdir = f'./workdir/{exp}'
-    return workdir
+    return f'./workdir/{exp}'
 
-def cm_train_defaults():
+def model_and_diffusion_defaults():
+
     return dict(
-        teacher_model_path="",
-        teacher_dropout=0.1,
-        training_mode="consistency_distillation",
-        target_ema_mode="fixed",
-        scale_mode="fixed",
-        total_training_steps=600000,
-        start_ema=0.0,
-        start_scales=40,
-        end_scales=40,
-        distill_steps_per_iter=50000,
-        loss_norm="lpips",
+        sigma_data=0.5,
+        sigma_min=0.002,
+        sigma_max=80.0,
+        beta_d=2.0,
+        beta_min=0.1,
+        cov_xy=0.0,
+
+        image_size=256,
+        in_channels=13,                   # Sentinel-2 13개 밴드
+        model_channels=22,                # base 채널 차원
+
+        channel_mult="1,2,4,8",           # 각 레벨별 배수
+        num_naf_blocks_enc="1,1,1,28",    # 인코더 레벨별 NAFBlock 수
+        num_naf_blocks_dec="1,1,1,1",     # 디코더 레벨별 NAFBlock 수
+        num_heads_per_level="1,1,2,4",    # SFBlock 헤드 수
+
+        dropout=0.0,
+        use_checkpoint=False,
+        use_scale_shift_norm=True,
+        use_fp16=False,
+
+        pred_mode="ve",                   # VE bridge
+        weight_schedule="karras",
+        rho=7.0,                          # Karras rho
     )
 
 def sample_defaults():
     return dict(
         generator="determ",
         clip_denoised=True,
-        sampler="euler",
+        sampler="heun",
         s_churn=0.0,
         s_tmin=0.002,
-        s_tmax=80,
+        s_tmax=80.0,
         s_noise=1.0,
         steps=40,
         model_path="",
@@ -42,323 +55,83 @@ def sample_defaults():
         ts="",
     )
 
-def model_and_diffusion_defaults():
-    """
-    Defaults for image training.
-    """
-    res = dict(
-        sigma_data=0.5,
-        sigma_min=0.002,
-        sigma_max=80.0,
-        beta_d=2,
-        beta_min=0.1,
-        cov_xy=0.,
-        image_size=256,
-        in_channels=3,
-        in_channels_opt=None,
-        in_channels_sar=None,
-        num_channels=128,
-        num_res_blocks=2,
-        num_heads=4,
-        num_heads_upsample=-1,
-        num_head_channels=-1,
-        unet_type='naf',
-        attention_resolutions="32,16,8",
-        channel_mult="",
-        dropout=0.0,
-        class_cond=False,
-        use_checkpoint=False,
-        use_scale_shift_norm=True,
-        resblock_updown=False,
-        use_fp16=False,
-        use_new_attention_order=False,
-        attention_type='flash',
-        learn_sigma=False,
-        condition_mode=None,
-        pred_mode='ve',
-        weight_schedule="karras",
-    )
-    return res
+def add_dict_to_argparser(parser, default_dict):
+    for k, v in default_dict.items():
+        t = type(v)
+        if v is None:
+            t = str
+        elif isinstance(v, bool):
+            t = str2bool
+        parser.add_argument(f"--{k}", default=v, type=t)
 
-'''
-2가지 종류의 U-Net에서 선택하는 구조(Parameter)
-1. ADM (Absorbing Diffusion model) or Classifier-Free Guidance ADM (DDPM Based, OPENAI)
-2. EDM (Elucidated Diffusion Model, NVIDIA)
+def args_to_dict(args, keys):
+    return {k: getattr(args, k) for k in keys}
 
-둘의 차이는 다음과 같다. 
-1. ADM
-    - Classifier-Free Guidance 사용 
-    - Loss: MSE
-    - Sampling: DDPM, DDIM ..
-    - Model: U-Net (with time conditioning)
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ("yes", "true", "t", "y", "1"):
+        return True
+    if v.lower() in ("no", "false", "f", "n", "0"):
+        return False
+    raise argparse.ArgumentTypeError("boolean value expected")
 
-2. EDM
-    - non fixed Noise schedule
-    - Loss: MSE
-    - Sampling: ODE/SDE + Heun's method(상미분 방정식 기법으로, 오일러 방식보다 더 안정적이라고 합니다.)
-    - Model: U-Net + time-free normalization(timestep embedding 없이 sigma 직접 주입)
-    - SOTA
-
-FAST + ODE-BASED SAMPLING -> EDM
-CLASSIFIER-FREE GUIDANCE + CLASS-CONDITIONING -> ADM
-
-이해를 돕기위한 TIP
-    1. EDM의 경우 ADM과 달리, T(Time step)을 사용하지 않음. Sigma로 T를 대체해서, Noise 주입
-    2. 그런 Sigma를 직접 주입하는 형태. (ADM의 경우 Timestep을 Embedding하는 형태였음)
-'''
-
-# TODO:
-# Model, Diffusion Create 
 def create_model_and_diffusion(
+    *,
     image_size,
     in_channels,
-    class_cond,
-    learn_sigma,
-    num_channels,
-    num_res_blocks,
-    channel_mult,
-    num_heads,
-    num_head_channels,
-    num_heads_upsample,
-    attention_resolutions,
-    dropout,
-    use_checkpoint,
-    use_scale_shift_norm,
-    resblock_updown,
-    use_fp16,
-    use_new_attention_order,
-    attention_type,
-    condition_mode,
-    pred_mode,
-    weight_schedule,
+    model_channels=22,
+    channel_mult=(1,2,4,8),
+    num_naf_blocks_enc=(1,1,1,28),
+    num_naf_blocks_dec=(1,1,1,1),
+    num_heads_per_level=(1,1,2,4),
+
+    dropout=0.0,
+    use_checkpoint=False,
+    use_scale_shift_norm=True,
+    use_fp16=False,
+
     sigma_data=0.5,
     sigma_min=0.002,
     sigma_max=80.0,
-    beta_d=2,
+    beta_d=2.0,
     beta_min=0.1,
-    cov_xy=0.,
-    unet_type='naf',
+    cov_xy=0.0,
+    pred_mode="ve",
+    weight_schedule="karras",
+    rho=7.0,
 ):
-    model = create_model(
-        image_size,
-        in_channels,
-        num_channels,
-        num_res_blocks,
-        unet_type=unet_type,
-        channel_mult=channel_mult,
-        learn_sigma=learn_sigma,
-        class_cond=class_cond,
-        use_checkpoint=use_checkpoint,
-        attention_resolutions=attention_resolutions,
-        num_heads=num_heads,
-        num_head_channels=num_head_channels,
-        num_heads_upsample=num_heads_upsample,
-        use_scale_shift_norm=use_scale_shift_norm,
+    cm       = tuple(int(x) for x in channel_mult.split(","))
+    # enc_blks = tuple(int(x) for x in num_naf_blocks_enc.split(","))
+    # dec_blks = tuple(int(x) for x in num_naf_blocks_dec.split(","))
+    heads    = tuple(int(x) for x in num_heads_per_level.split(","))
+
+    model = NAFUNetModel(
+        in_channels=in_channels,
+        out_channels=(in_channels * 2 if False else in_channels),  # learn_sigma=False 고정
+        model_channels=model_channels,
+        channel_mult=cm,
+        num_naf_blocks=1,
+
+        num_heads_per_level=heads,
         dropout=dropout,
-        resblock_updown=resblock_updown,
+        dims=2,
+        use_checkpoint=use_checkpoint,
+        # use_scale_shift_norm=use_scale_shift_norm,
         use_fp16=use_fp16,
-        use_new_attention_order=use_new_attention_order,
-        attention_type=attention_type,
-        condition_mode=condition_mode,
-        in_channels_opt=13,
-        in_channels_sar=2,
     )
+
     diffusion = KarrasDenoiser(
         sigma_data=sigma_data,
-        sigma_max=sigma_max,
         sigma_min=sigma_min,
+        sigma_max=sigma_max,
         beta_d=beta_d,
         beta_min=beta_min,
         cov_xy=cov_xy,
         image_size=image_size,
         weight_schedule=weight_schedule,
-        pred_mode=pred_mode
+        pred_mode=pred_mode,
+        rho=rho,
     )
+
     return model, diffusion
-
-# TODO:Create U-Net
-def create_model(
-    image_size,
-    in_channels,
-    num_channels,
-    num_res_blocks,
-    unet_type="naf",
-    channel_mult="",
-    learn_sigma=False,
-    class_cond=False,
-    use_checkpoint=False,
-    attention_resolutions="16",
-    num_heads=1,
-    num_head_channels=-1,
-    num_heads_upsample=-1,
-    use_scale_shift_norm=False,
-    dropout=0,
-    resblock_updown=False,
-    use_fp16=False,
-    use_new_attention_order=False,
-    attention_type='flash',
-    condition_mode=None,
-    
-    in_channels_opt=None,
-    in_channels_sar=None,
-):
-    if channel_mult == "":
-        if image_size == 512:
-            channel_mult = (0.5, 1, 1, 2, 2, 4, 4)
-        elif image_size == 256:
-            channel_mult = (1, 1, 2, 2, 4, 4)
-        elif image_size == 128:
-            channel_mult = (1, 1, 2, 3, 4)
-        elif image_size == 64:
-            channel_mult = (1, 2, 3, 4)
-        elif image_size == 32:
-            channel_mult = (1, 2, 3, 4)
-        else:
-            raise ValueError(f"unsupported image size: {image_size}")
-    else:
-        channel_mult = tuple(int(ch_mult) for ch_mult in channel_mult.split(","))
-   
-    attention_ds = []
-    for res in attention_resolutions.split(","):
-        attention_ds.append(image_size // int(res))
-    # TODO: From unet.py (not EDM)
-    # if unet_type == 'adm':
-    #     return UNetModel(
-    #         image_size=image_size,
-    #         in_channels=in_channels,
-    #         model_channels=num_channels,
-    #         out_channels=(in_channels if not learn_sigma else in_channels*2),
-    #         num_res_blocks=num_res_blocks,
-    #         attention_resolutions=tuple(attention_ds),
-    #         dropout=dropout,
-    #         channel_mult=channel_mult,
-    #         num_classes=(NUM_CLASSES if class_cond else None),
-    #         use_checkpoint=use_checkpoint,
-    #         use_fp16=use_fp16,
-    #         num_heads=num_heads,
-    #         num_head_channels=num_head_channels,
-    #         num_heads_upsample=num_heads_upsample,
-    #         use_scale_shift_norm=use_scale_shift_norm,
-    #         resblock_updown=resblock_updown,
-    #         use_new_attention_order=use_new_attention_order,
-    #         attention_type=attention_type,
-    #         condition_mode=condition_mode,
-    #     )
-    if unet_type == 'edm':
-        return SongUNet(
-            img_resolution=image_size,
-            in_channels=in_channels,
-            model_channels=num_channels,
-            out_channels=(in_channels if not learn_sigma else in_channels*2),
-            num_blocks=4,
-            attn_resolutions=[16],
-            dropout=dropout,
-            channel_mult=channel_mult,
-            channel_mult_noise=2,
-            embedding_type='fourier',
-            encoder_type='residual', 
-            decoder_type='standard',
-            resample_filter=[1,3,3,1],
-        )
-    # TODO: NAF-UNET ADD (num_head_channels -> need to divide?)
-    elif unet_type == 'naf':
-        return NAFUNetModel(
-            in_channels_opt=in_channels_opt,
-            in_channels_sar=in_channels_sar,
-            out_channels=(in_channels if not learn_sigma else in_channels*2),
-            channels_mult=(1, 2, 4, 8),
-            num_heads_per_level=(1, 1, 2, 4),
-            dropout=0.0,
-            use_checkpoint=use_checkpoint,
-            use_fp16=use_fp16,
-        )
-    else:
-        raise ValueError(f"Unsupported unet type: {unet_type}")
-
-def create_ema_and_scales_fn(
-    target_ema_mode,
-    start_ema,
-    scale_mode,
-    start_scales,
-    end_scales,
-    total_steps,
-    distill_steps_per_iter,
-):
-    def ema_and_scales_fn(step):
-        if target_ema_mode == "fixed" and scale_mode == "fixed":
-            target_ema = start_ema
-            scales = start_scales
-        elif target_ema_mode == "fixed" and scale_mode == "progressive":
-            target_ema = start_ema
-            scales = np.ceil(
-                np.sqrt(
-                    (step / total_steps) * ((end_scales + 1) ** 2 - start_scales**2)
-                    + start_scales**2
-                )
-                - 1
-            ).astype(np.int32)
-            scales = np.maximum(scales, 1)
-            scales = scales + 1
-
-        elif target_ema_mode == "adaptive" and scale_mode == "progressive":
-            scales = np.ceil(
-                np.sqrt(
-                    (step / total_steps) * ((end_scales + 1) ** 2 - start_scales**2)
-                    + start_scales**2
-                )
-                - 1
-            ).astype(np.int32)
-            scales = np.maximum(scales, 1)
-            c = -np.log(start_ema) * start_scales
-            target_ema = np.exp(-c / scales)
-            scales = scales + 1
-        elif target_ema_mode == "fixed" and scale_mode == "progdist":
-            distill_stage = step // distill_steps_per_iter
-            scales = start_scales // (2**distill_stage)
-            scales = np.maximum(scales, 2)
-
-            sub_stage = np.maximum(
-                step - distill_steps_per_iter * (np.log2(start_scales) - 1),
-                0,
-            )
-            sub_stage = sub_stage // (distill_steps_per_iter * 2)
-            sub_scales = 2 // (2**sub_stage)
-            sub_scales = np.maximum(sub_scales, 1)
-
-            scales = np.where(scales == 2, sub_scales, scales)
-
-            target_ema = 1.0
-        else:
-            raise NotImplementedError
-
-        return float(target_ema), int(scales)
-
-    return ema_and_scales_fn
-
-
-def add_dict_to_argparser(parser, default_dict):
-    for k, v in default_dict.items():
-        v_type = type(v)
-        if v is None:
-            v_type = str
-        elif isinstance(v, bool):
-            v_type = str2bool
-        parser.add_argument(f"--{k}", default=v, type=v_type)
-
-
-def args_to_dict(args, keys):
-    return {k: getattr(args, k) for k in keys}
-
-
-def str2bool(v):
-    """
-    https://stackoverflow.com/questions/15008758/parsing-boolean-values-with-argparse
-    """
-    if isinstance(v, bool):
-        return v
-    if v.lower() in ("yes", "true", "t", "y", "1"):
-        return True
-    elif v.lower() in ("no", "false", "f", "n", "0"):
-        return False
-    else:
-        raise argparse.ArgumentTypeError("boolean value expected")

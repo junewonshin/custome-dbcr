@@ -14,8 +14,11 @@ from .nn import (
     checkpoint,
     conv_nd,
     zero_module,
-    LayerNorm,
     normalization,
+    linear,
+    SiLU,
+    timestep_embedding,
+    LayerNorm
 )
 
 
@@ -43,14 +46,12 @@ class SqueezeExcite(nn.Module):
         )
 
     def forward(self, x):
-        return x * self.fc(self.pool(x))
+        pooled = self.pool(x)
+        return x * self.fc(pooled.to(x.dtype))
 
 
 class MBConv(nn.Module):
-    """
-    point-wise → depth-wise → SE(채널 어텐션) → projection
-    residual if in_channels == out_channels
-    """
+
     def __init__(
         self,
         in_channels,
@@ -64,24 +65,38 @@ class MBConv(nn.Module):
         self.use_residual = (in_channels == out_channels)
         hidden = in_channels * expansion
 
-        # 1×1 pointwise expansion
+        # expansion
         self.expand = conv_nd(dims, in_channels, hidden, 1)
-        # 3×3 depthwise conv
+        # depthwise
         self.dw = conv_nd(dims, hidden, hidden, 3, padding=1, groups=hidden)
-        # channel attention
+        # channel‑attention
         self.se = SqueezeExcite(hidden, reduction, dims)
-        # 1×1 projection
+        # projection
         self.project = conv_nd(dims, hidden, out_channels, 1)
         self.act = nn.SiLU()
-        self.dropout = nn.Dropout(p=dropout)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        h = self.act(self.expand(x))
-        h = self.act(self.dw(h))
-        h = self.se(h)
-        h = self.project(h)
+        dtype = x.dtype
+        # keep original for residual
+        x_in = x
+
+        # Pointwise expansion
+        h = self.expand(x).to(dtype)
+        h = self.act(h)
+
+        # Depthwise
+        h = self.dw(h).to(dtype)
+        h = self.act(h)
+
+        # SE
+        h = self.se(h).to(dtype)
+
+        # Projection
+        h = self.project(h).to(dtype)
         h = self.dropout(h)
-        return x + h if self.use_residual else h
+
+        return x_in + h if self.use_residual else h
 
 
 '''
@@ -110,82 +125,88 @@ after coding, we can rewrite it briefly
 '''
 class SFBlock(nn.Module):
     """
-    Cross-attention fusion block for DB-CR backbone.
-    Q from Optical branch, K/V from SAR branch.
-
-    Steps:
-    1. Normalize & project Q, K, V via 1x1 conv
-    2. Flatten spatial dims → sequence length HW
-    3. Split into heads and compute scaled dot-product attention
-    4. Concat heads, MLP (2 x hidden) + residual
-    5. Reshape back to (B, C, H, W), final 1x1 conv
+    Channel-wise cross-attention fusion block.
+    Q from optical branch, K/V from SAR branch.
+    Computes C×C attention over channels.
     """
-    def __init__(
-        self,
-        channels,
-        num_heads=1,
-        mlp_ratio=2,
-        dims=2,
-    ):
+    def __init__(self, channels, num_heads=4, mlp_ratio=2, dims=2):
         super().__init__()
-        assert channels % num_heads == 0, "channels must be divisible by num_heads"
+        assert channels % num_heads == 0
         self.num_heads = num_heads
-        self.head_dim = channels // num_heads
-
-        # 1×1 projections with normalization
+        self.head_dim  = (channels * (dims == 2 and 1 or 1))  # we'll split features below
+        # 1) Norm + 1×1 conv
         self.norm_q  = normalization(channels)
         self.q_proj  = conv_nd(dims, channels, channels, 1)
         self.norm_kv = normalization(channels)
         self.k_proj  = conv_nd(dims, channels, channels, 1)
         self.v_proj  = conv_nd(dims, channels, channels, 1)
-
-        # MLP after attention
-        hidden_dim = channels * mlp_ratio
+        # 2) MLP on channel embeddings
+        hidden = channels * mlp_ratio
         self.mlp = nn.Sequential(
-            nn.Linear(channels, hidden_dim),
+            nn.Linear(channels, hidden),
             nn.GELU(),
-            nn.Linear(hidden_dim, channels),
+            nn.Linear(hidden, channels),
         )
-
-        # Final 1×1 conv, zero-init for stable fusion
+        # 3) Final 1×1 conv
         self.out_proj = zero_module(conv_nd(dims, channels, channels, 1))
 
     def forward(self, feat_opt, feat_sar):
         B, C, H, W = feat_opt.shape
         HW = H * W
 
-        # 1. Norm + 1×1 conv
-        q = self.q_proj(self.norm_q(feat_opt))   # [B, C, H, W]
-        k = self.k_proj(self.norm_kv(feat_sar))
-        v = self.v_proj(self.norm_kv(feat_sar))
+        # 1) Norm + conv1×1
+        q = self.norm_q(feat_opt).to(feat_opt.dtype)
+        k = self.norm_kv(feat_sar).to(feat_opt.dtype)
+        v = self.norm_kv(feat_sar).to(feat_opt.dtype)
 
-        # 2. Flatten to [B, HW, C]
-        q_flat = q.view(B, C, HW).transpose(1, 2)
-        k_flat = k.view(B, C, HW).transpose(1, 2)
-        v_flat = v.view(B, C, HW).transpose(1, 2)
+        q = self.q_proj(q)    # [B, C, H, W]
+        k = self.k_proj(k)    # [B, C, H, W]
+        v = self.v_proj(v)    # [B, C, H, W]
 
-        # 3. Split heads → [B, num_heads, HW, head_dim]
-        def split_heads(x):
-            return x.view(B, HW, self.num_heads, self.head_dim).transpose(1, 2)
-        qh = split_heads(q_flat)
-        kh = split_heads(k_flat)
-        vh = split_heads(v_flat)
+        # 2) Flatten spatial dims → feature dim
+        #    shape becomes [B, C, HW]
+        q = q.reshape(B, C, HW)
+        k = k.reshape(B, C, HW)
+        v = v.reshape(B, C, HW)
 
-        # 4. Scaled dot-product attention
-        scale = self.head_dim ** -0.5
-        attn = th.softmax(th.matmul(qh, kh.transpose(-2, -1)) * scale, dim=-1)
-        attn_out = th.matmul(attn, vh)  # [B, num_heads, HW, head_dim]
+        # 3) Multi-head channel attention
+        #    Sequence length = C, embed dim = HW // num_heads
+        head_dim = HW // self.num_heads
+        assert head_dim * self.num_heads == HW, "HW must be divisible by num_heads"
 
-        # 5. Concat heads → [B, HW, C]
-        out_flat = attn_out.transpose(1, 2).reshape(B, HW, C)
+        # Split heads on feature axis
+        # q_h: [B, num_heads, C, head_dim]
+        q_h = q.reshape(B, C, self.num_heads, head_dim) \
+               .permute(0, 2, 1, 3)
+        k_h = k.reshape(B, C, self.num_heads, head_dim) \
+               .permute(0, 2, 1, 3)
+        v_h = v.reshape(B, C, self.num_heads, head_dim) \
+               .permute(0, 2, 1, 3)
 
-        # 6. MLP + residual
-        mlp_out = self.mlp(out_flat)
-        fused = out_flat + mlp_out  # [B, HW, C]
+        # Scaled dot-product over channels
+        scale = head_dim ** -0.5
+        # attn: [B, num_heads, C, C]
+        attn = (q_h @ k_h.transpose(-2, -1)) * scale
+        attn = F.softmax(attn, dim=-1)
 
-        # 7. Reshape back → [B, C, H, W], final conv
-        fused = fused.transpose(1, 2).reshape(B, C, H, W)
-        return self.out_proj(fused)
+        # apply to V
+        # out_h: [B, num_heads, C, head_dim]
+        out_h = attn @ v_h
+
+        # 4) Merge heads → [B, C, HW]
+        out = out_h.permute(0, 2, 1, 3)   # [B, C, num_heads, head_dim]
+        out = out.reshape(B, C, HW)
+
+        # 5) MLP over channel embeddings
+        #    We treat each of the HW positions independently:
+        #    out.permute -> [B*HW, C], MLP, then back
+        out = out.permute(0, 2, 1).reshape(B*HW, C)  # [B*HW, C]
+        out = self.mlp(out)                          # [B*HW, C]
+        out = out.reshape(B, HW, C).permute(0, 2, 1)  # [B, C, HW]
+
+        # 6) reshape to (B,C,H,W), residual + final conv
+        out = out.reshape(B, C, H, W) + feat_opt
+        return self.out_proj(out)
 '''
 NAFBlock
 
@@ -223,9 +244,8 @@ Basic Architecture
 '''
 class NAFBlock(nn.Module):
     """
-    1. LN → 2. MBConv → 3. +X
-    4. LN → 5. FFN → 6. +Z
-    7. SimpleGate
+    1. LN → MBConv → +X
+    2. LN → FFN (with SimpleGate) → +Z
     """
     def __init__(
         self,
@@ -233,57 +253,73 @@ class NAFBlock(nn.Module):
         dropout=0.0,
         dims=2,
         use_checkpoint=False,
+        emb_channels=None,
+        use_scale_shift_norm=True,
     ):
         super().__init__()
         assert channels % 2 == 0, "channels must be divisible by 2 for SimpleGate"
         self.use_checkpoint = use_checkpoint
+        self.use_scale_shift_norm = use_scale_shift_norm
 
         # 1) first normalization + MBConv
         self.norm1 = normalization(channels)
         self.mbconv = MBConv(channels, channels, dims=dims, dropout=dropout)
 
-        # 2) second normalization + FFN
+        # 2) second normalization + FFN w/ SimpleGate baked in
         self.norm2 = normalization(channels)
+        hidden = channels * 2
+        # In Paper, Apply SimpleGate after ffn ... ?
         self.ffn = nn.Sequential(
-            conv_nd(dims, channels, channels * 2, 1),
+            # expand to 2×channels
+            conv_nd(dims, channels, hidden, 3, padding=1),
+            conv_nd(dims, hidden, hidden, 3, padding=1),
             SimpleGate(),
-            conv_nd(dims, channels, channels, 1),
-            nn.Dropout(p=dropout),
         )
 
-        # residual weights
-        self.beta = nn.Parameter(th.zeros(1, channels, 1, 1))
-        self.gamma = nn.Parameter(th.zeros(1, channels, 1, 1))
+        # optional scale‑&‑shift time embedding
+        if emb_channels is not None:
+            out_dim = 2 * channels if use_scale_shift_norm else channels
+            self.emb_layers = nn.Sequential(
+                nn.SiLU(),
+                linear(emb_channels, out_dim), # 22 -> 44, 44 -> 88, 88 -> 176
+            )
+        else:
+            self.emb_layers = None
 
-    def forward(self, x):
-        return checkpoint(self._forward, (x,), self.parameters(), self.use_checkpoint)
+    def forward(self, x, emb=None):
+        # gradient checkpointing if desired
+        return checkpoint(self._forward, (x, emb), self.parameters(), self.use_checkpoint)
 
-    def _forward(self, x):
-        # Stage 1: LN → MBConv → +X
-        h = self.norm1(x)
+    def _forward(self, x, emb):
+
+        h = self.norm1(x).to(x.dtype)
         h = self.mbconv(h)
-        x1 = x + self.beta * h
+        x1 = x + h
 
-        # Stage 2: LN → FFN → +Z
-        h2 = self.norm2(x1)
+        h2 = self.norm2(x1).to(x.dtype)
+
+        if self.emb_layers is not None and emb is not None:
+            emb_out = self.emb_layers(emb.to(x.dtype))
+            if self.use_scale_shift_norm:
+                scale, shift = emb_out.chunk(2, dim=1)
+                h2 = h2 * (1 + scale[..., None, None]) + shift[..., None, None]
+            else:
+                h2 = h2 + emb_out[..., None, None]
+
         h2 = self.ffn(h2)
-        x2 = x1 + self.gamma * h2
-
-        # Stage 3: final gating
-        return SimpleGate()(x2)
-
+        return x1 + h2
 
 
 class NAFUNetModel(nn.Module):
     def __init__(
         self,
-        in_channels_opt,
-        in_channels_sar,
-        out_channels,
+        in_channels=13,    # 13 -> 3 
+        sar_channels=2,
+        out_channels=13,
         model_channels=22,
-        channel_mult=(1, 2, 4, 8),
+        channel_mult=(1,2,4,8),
         num_naf_blocks=1,
-        num_heads_per_level=(1, 1, 2, 4),
+        num_heads_per_level=(1,1,2,4),
         dropout=0.0,
         dims=2,
         use_checkpoint=False,
@@ -291,100 +327,162 @@ class NAFUNetModel(nn.Module):
         use_fp16=False,
     ):
         super().__init__()
-        self.num_levels = len(channel_mult)
-        self.channel_list = [model_channels * m for m in channel_mult]
         self.dtype = th.float16 if use_fp16 else th.float32
 
-        # 1. Pre-embedding
-        self.opt_embed = conv_nd(dims, in_channels_opt, self.channel_list[0], 3, padding=1)
-        self.sar_embed = conv_nd(dims, in_channels_sar, self.channel_list[0], 3, padding=1)
+        # time‑embed dimension, 22
+        self.emb_channels = model_channels
 
-        # 2. Encoders + Fusion
-        self.encoder_opt = nn.ModuleList()
-        self.encoder_sar = nn.ModuleList()
-        self.fusion_blocks = nn.ModuleList()
-        self.downsamples_opt = nn.ModuleList()
-        self.downsamples_sar = nn.ModuleList()
+        # 3x3 input embeddings
+        self.opt_embed = conv_nd(dims, in_channels, model_channels, 3, padding=1)
+        self.sar_embed = conv_nd(dims, sar_channels, model_channels, 3, padding=1)
 
-        ch = self.channel_list[0]
-        for lvl in range(self.num_levels):
-            out_ch = self.channel_list[lvl]
+        # compute channels at each level
+        self.channel_list = [model_channels * m for m in channel_mult]
+        self.num_levels   = len(self.channel_list)
 
-            # each level: stack of NAFBlocks
+        # 1) encoders and fusion modules
+        self.encoder_opt      = nn.ModuleList()
+        self.encoder_sar      = nn.ModuleList()
+        self.fusion_blocks    = nn.ModuleList()
+        self.downsamples_opt  = nn.ModuleList()
+        self.downsamples_sar  = nn.ModuleList()
+
+        for lvl, ch in enumerate(self.channel_list):
+            # stack of NAFBlocks
             self.encoder_opt.append(nn.Sequential(*[
-                NAFBlock(ch, dropout, dims, use_checkpoint)
+                NAFBlock(ch, dropout, dims, use_checkpoint, emb_channels=self.emb_channels)
                 for _ in range(num_naf_blocks)
             ]))
             self.encoder_sar.append(nn.Sequential(*[
-                NAFBlock(ch, dropout, dims, use_checkpoint)
+                NAFBlock(ch, dropout, dims, use_checkpoint, emb_channels=self.emb_channels)
                 for _ in range(num_naf_blocks)
             ]))
 
-            # fusion SFBlock
-            self.fusion_blocks.append(SFBlock(
-                channels=out_ch,
-                num_heads=num_heads_per_level[lvl],
-                dims=dims
-            ))
+            # fusion SFBlock defined elsewhere
+            self.fusion_blocks.append(
+                SFBlock(ch, num_heads=num_heads_per_level[lvl], dims=dims)
+            )
 
-            # downsample if not last
-            if lvl != self.num_levels - 1:
+            # downsample except last
+            if lvl < self.num_levels-1:
                 self.downsamples_opt.append(
-                    Downsample(out_ch, use_conv=conv_resample, dims=dims)
+                    Downsample(ch, use_conv=conv_resample, dims=dims)
                 )
                 self.downsamples_sar.append(
-                    Downsample(out_ch, use_conv=conv_resample, dims=dims)
+                    Downsample(ch, use_conv=conv_resample, dims=dims)
                 )
 
-            ch = out_ch
+        # 2) middle
+        mid_ch = self.channel_list[-1]
+        self.middle_block = NAFBlock(mid_ch, dropout, dims, use_checkpoint, emb_channels=self.emb_channels)
 
-        # 3. Middle block
-        self.middle_block = NAFBlock(ch, dropout, dims, use_checkpoint)
-
-        # 4. Decoder (Opt only)
-        self.decoder = nn.ModuleList()
+        # 3) decoder (optical only)
+        self.decoder   = nn.ModuleList()
         self.upsamples = nn.ModuleList()
-        for lvl in reversed(range(self.num_levels)):
-            out_ch = self.channel_list[lvl]
-            # concatenated channels = current ch + skip ch
-            self.decoder.append(NAFBlock(ch + out_ch, dropout, dims, use_checkpoint))
-            ch = out_ch
-            if lvl != 0:
+        for lvl, ch in enumerate(reversed(self.channel_list)):
+            self.decoder.append(
+                NAFBlock(ch, dropout, dims, use_checkpoint, emb_channels=self.emb_channels)
+            )
+            if lvl < self.num_levels-1:
                 self.upsamples.append(
                     Upsample(ch, use_conv=conv_resample, dims=dims)
                 )
 
-        # 5. Output
-        self.out = nn.Sequential(
-            normalization(ch),
-            nn.SiLU(),
-            zero_module(conv_nd(dims, ch, out_channels, 3, padding=1))
-        )
+        # 4) final output conv
+        self.out = zero_module(conv_nd(dims, model_channels, out_channels, 1))
 
-    def forward(self, opt, sar):
-        h_opt = self.opt_embed(opt)
-        h_sar = self.sar_embed(sar)
+        # convert to fp16 if requested
+        if use_fp16:
+            self.convert_to_fp16()
 
-        skips = []
-        # Encoder + Fusion
-        for i in range(self.num_levels):
-            h_opt = self.encoder_opt[i](h_opt)
-            h_sar = self.encoder_sar[i](h_sar)
-            h_opt = self.fusion_blocks[i](h_opt, h_sar)
-            skips.append(h_opt)
-            if i != self.num_levels - 1:
-                h_opt = self.downsamples_opt[i](h_opt)
-                h_sar = self.downsamples_sar[i](h_sar)
+    def convert_to_fp16(self):
+        for m in self.modules():
+            if isinstance(m, LayerNorm):
+                m.float()
+            else:
+                m.half()
 
-        # Middle
-        h = self.middle_block(h_opt)
+    def convert_to_fp32(self):
+        for m in self.modules():
+            m.float()
 
-        # Decoder + skip
-        for idx, dec_block in enumerate(self.decoder):
-            skip = skips.pop()
-            h = th.cat([h, skip], dim=1)
-            h = dec_block(h)
-            if idx < len(self.upsamples):
-                h = self.upsamples[idx](h)
+    def forward(self, x, t, opt, sar):
+        # x: noisy cloudy input (unused here, we start from y directly)
+        # t: time steps, opt: optical cloudy, sar: SAR
+        dtype = self.dtype
 
-        return self.out(h)
+        # Dataset
+        # debug_stats("opt (in)", opt)
+        # debug_stats("sar (in)", sar)
+
+        # debug_stats("opt_embed.W", self.opt_embed.weight)
+        # if self.opt_embed.bias is not None:
+        #     debug_stats("opt_embed.b", self.opt_embed.bias)
+        # debug_stats("sar_embed.W", self.sar_embed.weight)
+        # if self.sar_embed.bias is not None:
+        #     debug_stats("sar_embed.b", self.sar_embed.bias)
+
+        # embed time once
+        t_emb = timestep_embedding(t.to(dtype), dim=self.emb_channels).to(dtype)
+        # debug_stats("t_emb", t_emb)
+
+        # embed inputs
+        try:
+            h_opt = self.opt_embed(opt.to(dtype))
+        except Exception as e:
+            # print("[ERROR] opt_embed conv failed:", e)
+            raise
+        # debug_stats("h_opt after emb", h_opt)
+
+        try:
+            h_sar = self.sar_embed(sar.to(dtype))
+        except Exception as e:
+            # print("[ERROR] sar_embed conv failed:", e)
+            raise
+        # debug_stats("h_sar after emb", h_sar)
+
+        # encoder + fusion
+        for lvl in range(self.num_levels):
+            # modality‑specific NAFBlocks (with time emb)
+            for blk in self.encoder_opt[lvl]:
+                h_opt = blk(h_opt, t_emb)
+            for blk in self.encoder_sar[lvl]:
+                h_sar = blk(h_sar, t_emb)
+
+            # cross‑modal fusion
+            h_opt = self.fusion_blocks[lvl](h_opt, h_sar)
+            # debug_stats(f"h_opt after fusion{lvl}", h_opt)
+
+            # downsample if not last
+            if lvl < self.num_levels-1:
+                h_opt = self.downsamples_opt[lvl](h_opt)
+                h_sar = self.downsamples_sar[lvl](h_sar)
+        # middle
+        h = self.middle_block(h_opt, t_emb)
+        # decoder (only optical path)
+        for i, dec in enumerate(self.decoder):
+            h = dec(h, t_emb)
+            if i < len(self.upsamples):
+                h = self.upsamples[i](h)
+        # debug_stats("pre-out h", h)
+
+        out = self.out(h)
+        # debug_stats("final out", out)
+
+        # final projection
+        return out
+
+
+
+# def debug_stats(name, x):
+#     """ Tensor x 의 shape, dtype, min/max, NaN/Inf 여부를 출력 """
+#     with th.no_grad():
+#         x_cpu = x.detach().float().cpu()
+#         mn = x_cpu.min().item()
+#         mx = x_cpu.max().item()
+#         has_nan = th.isnan(x_cpu).any().item()
+#         has_inf = th.isinf(x_cpu).any().item()
+#     # tuple(x.shape) → 문자열로 바꿔서 출력
+#     shape_str = str(tuple(x.shape))
+#     print(f"[DEBUG] {name:12s} shape={shape_str:15s} dtype={str(x.dtype):7s}"
+#           f" min/max=({mn:.6g},{mx:.6g}) nan={has_nan} inf={has_inf}")

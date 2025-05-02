@@ -114,7 +114,8 @@ def normalization(channels):
     :param channels: number of input channels.
     :return: an nn.Module for normalization.
     """
-    return GroupNorm32(32, channels)
+    # TODO:
+    return LayerNorm(channels)
 
 
 def timestep_embedding(timesteps, dim, max_period=10000):
@@ -208,13 +209,15 @@ class SinusoidalPosEmb(nn.Module):
     
 
 class LayerNorm(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, channels, eps=1e-5):
         super().__init__()
-        self.g = nn.Parameter(torch.ones(1, dim, 1, 1))
+        self.eps = eps
+        self.g = nn.Parameter(torch.ones(1, channels, 1, 1))
 
     def forward(self, x):
-        eps = 1e-5 if x.dtype == torch.float32 else 1e-3
-        var = torch.var(x, dim = 1, unbiased = False, keepdim = True)
-        mean = torch.mean(x, dim = 1, keepdim = True)
-        return (x - mean) * (var + eps).rsqrt() * self.g
+        mean = x.mean(dim=1, keepdim=True)
+        var = x.var(dim=1, unbiased=False, keepdim=True)
+        return (x - mean) * (var + self.eps).rsqrt() * self.g
+
+
     

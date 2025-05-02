@@ -32,7 +32,7 @@ import glob
 # 20-21 within the first ~1K steps of training.
 INITIAL_LOG_LOSS_SCALE = 20.0
 
-import wandb
+# import wandb
 
 class TrainLoop:
     def __init__(
@@ -65,7 +65,6 @@ class TrainLoop:
         self.diffusion = diffusion
         self.data = train_data
         self.test_data = test_data
-        self.image_size = model.image_size
         self.batch_size = batch_size
         self.microbatch = microbatch if microbatch > 0 else batch_size
         self.lr = lr
@@ -100,6 +99,9 @@ class TrainLoop:
             use_fp16=self.use_fp16,
             fp16_scale_growth=fp16_scale_growth,
         )
+
+        self.dtype = th.float16 if use_fp16 else th.float32
+        self.device = dist_util.dev()
 
         self.opt = RAdam(
             self.mp_trainer.master_params, lr=self.lr, weight_decay=self.weight_decay
@@ -138,7 +140,7 @@ class TrainLoop:
 
         self.step = self.resume_step
 
-        self.generator = get_generator(sample_kwargs['generator'], self.batch_size,42)
+        self.generator = get_generator(sample_kwargs['generator'], self.batch_size, sample_kwargs['seed'])
         self.sample_kwargs = sample_kwargs
 
         self.augment = augment_pipe
@@ -186,7 +188,7 @@ class TrainLoop:
         else:
             prefix = ''
         opt_checkpoint = bf.join(
-            bf.dirname(main_checkpoint), f"{prefix}opt{self.resume_step:06}.pt"
+            bf.dirname(main_checkpoint), f"{prefix}opt_{self.resume_step:06}.pt"
         )
         if bf.exists(opt_checkpoint):
             logger.log(f"loading optimizer state from checkpoint: {opt_checkpoint}")
@@ -206,62 +208,47 @@ class TrainLoop:
         while True:
             for (opt, sar), target in self.data:
                 if not (not self.lr_anneal_steps or self.step < self.total_training_steps):
-                    # Save the last checkpoint if it wasn't already saved.
                     if (self.step - 1) % self.save_interval != 0:
                         self.save()
                     return
-                # scale to [-1, 1]
-                
+
                 target = self.preprocess(target)
                 opt    = self.preprocess(opt)
                 sar    = self.preprocess(sar)
-                    
-                # if self.augment is not None:
-                #     batch, _ = self.augment(batch)
-                # if isinstance(cond, th.Tensor) and batch.ndim == cond.ndim:
-                #     xT = self.preprocess(cond)
-                    
-                #     cond = {'xT': xT}
-                # else:
-                #     cond['xT'] = self.preprocess(cond['xT'])
+
+                target = target.to(device=self.device, dtype=self.dtype)
+                opt    = opt.to(device=self.device, dtype=self.dtype)
+                sar    = sar.to(device=self.device, dtype=self.dtype)
 
                 batch = target
                 cond = {'opt': opt, 'sar': sar}
                     
                 took_step = self.run_step(batch, cond)
-                if took_step and self.step % self.log_interval == 0:
-                    logs = logger.dumpkvs()
-
-                    if dist.get_rank() == 0:
-                        wandb.log(logs, step=self.step)
-                        
-                if took_step and self.step % self.save_interval == 0:
-                    self.save()
-                    # Run for a finite amount of time in integration tests.
-                    if os.environ.get("DIFFUSION_TRAINING_TEST", "") and self.step > 0:
-                        return
-                    
-                    # test_batch, test_cond, _ = next(iter(self.test_data))
-                    # test_batch = self.preprocess(test_batch)
-                    # if isinstance(test_cond, th.Tensor) and test_batch.ndim == test_cond.ndim:
-                    #     test_cond = {'xT': self.preprocess(test_cond)}
-                    # else:
-                    #     test_cond['xT'] = self.preprocess(test_cond['xT'])
-                    # self.run_test_step(test_batch, test_cond)
-
+                if self.step % self.log_interval == 0:
+                    logs = logger.dumpkvs()     
+                                                      
+                if self.step % self.test_interval == 0:
                     (test_opt, test_sar), test_target = next(iter(self.test_data))
                     test_target = self.preprocess(test_target)
                     test_opt    = self.preprocess(test_opt)
                     test_sar    = self.preprocess(test_sar)
 
+                    test_target = test_target.to(device=self.device, dtype=self.dtype)
+                    test_opt    = test_opt.to(device=self.device, dtype=self.dtype)
+                    test_sar    = test_sar.to(device=self.device, dtype=self.dtype)
+
                     test_batch = test_target
                     test_cond = {'opt':test_opt, 'sar':test_sar}
                     self.run_test_step(test_batch, test_cond)
 
-                    logs = logger.dumpkvs()
+                    logger.dumpkvs()
 
-                    if dist.get_rank() == 0:
-                        wandb.log(logs, step=self.step)
+
+                if self.step % self.save_interval == 0:
+                    self.save()
+                    # Run for a finite amount of time in integration tests.
+                    if os.environ.get("DIFFUSION_TRAINING_TEST", "") and self.step > 0:
+                        return
 
                 if took_step and self.step % self.save_interval_for_preemption == 0:
                     self.save(for_preemption=True)
@@ -284,40 +271,50 @@ class TrainLoop:
     def forward_backward(self, batch, cond, train=True):
         if train:
             self.mp_trainer.zero_grad()
-        for i in range(0, batch.shape[0], self.microbatch):
-            micro = batch[i : i + self.microbatch].to(dist_util.dev())
-            micro_cond = {
-                k: v[i : i + self.microbatch].to(dist_util.dev())
-                for k, v in cond.items()
-            }
-            last_batch = (i + self.microbatch) >= batch.shape[0]
-            t, weights = self.schedule_sampler.sample(micro.shape[0], dist_util.dev())
 
-            compute_losses = functools.partial(
-                    self.diffusion.training_bridge_losses,
-                    self.ddp_model,
-                    micro,
-                    t,
-                    model_kwargs=micro_cond,
-                )
+        gt_imgs    = batch
+        opt_imgs   = cond['opt']
+        sar_imgs   = cond['sar']
 
-            if last_batch or not self.use_ddp:
-                losses = compute_losses()
-            else:
-                with self.ddp_model.no_sync():
-                    losses = compute_losses()
+        x0  = gt_imgs.to(device=self.device, dtype=self.dtype)
+        opt = opt_imgs.to(device=self.device, dtype=self.dtype)
+        sar = sar_imgs.to(device=self.device, dtype=self.dtype)
 
-            if isinstance(self.schedule_sampler, LossAwareSampler) and train:
-                self.schedule_sampler.update_with_local_losses(
-                    t, losses["loss"].detach()
-                )
+        x_start = (opt, sar)
+        sub_cond = {'opt': opt, 'sar': sar, 'x0': x0}
 
-            loss = (losses["loss"] * weights).mean()
-            log_loss_dict(
-                self.diffusion, t, {k if train else 'test_'+k: v * weights for k, v in losses.items()}
+        t, weights = self.schedule_sampler.sample(opt.shape[0], device=dist_util.dev())
+        if t.dim() == 0:
+            weights = weights.unsqueeze(0)
+            t       = t.unsqueeze(0)
+
+        t = t.to(device=self.device, dtype=self.dtype)
+        weights = weights.to(device=self.device, dtype=self.dtype)
+
+        loss_fn = functools.partial(
+            self.diffusion.training_bridge_losses,
+            self.ddp_model,
+            x_start,
+            t,
+            model_kwargs=sub_cond,
+        )
+
+        if train and not self.use_ddp:
+            with self.ddp_model.no_sync():
+                losses = loss_fn()
+        else:
+            losses = loss_fn()
+
+        if train and isinstance(self.schedule_sampler, LossAwareSampler):
+            self.schedule_sampler.update_with_local_losses(
+                t, losses['loss'].detach()
             )
-            if train:
-                self.mp_trainer.backward(loss)
+
+        loss = (losses['loss'] * weights).mean()
+        self._log_losses(t, losses, prefix='' if train else 'test_')
+        if train:
+            self.mp_trainer.backward(loss)
+
 
     def _update_ema(self):
         for rate, params in zip(self.ema_rate, self.ema_params):
@@ -331,6 +328,18 @@ class TrainLoop:
         for param_group in self.opt.param_groups:
             param_group["lr"] = lr
 
+    def _log_losses(self, t, losses, prefix=''):
+        logger.logkv(f"{prefix}step", self.step)
+
+        try:
+            sig_mean = float(t.mean().item())
+            logger.logkv(f"{prefix}sigma_mean", sig_mean)
+        except Exception:
+            pass
+
+        for name, val in losses.items():
+            logger.logkv(f"{prefix}{name}", float(val.item()))
+                
     def log_step(self):
         logger.logkv("step", self.step)
         logger.logkv("samples", (self.step + 1) * self.global_batch)
@@ -343,9 +352,6 @@ class TrainLoop:
                 earliest = min(freq_states, key=lambda x: x.split('_')[-1].split('.')[0])
                 os.remove(earliest)
                     
-
-        # if dist.get_rank() == 0 and for_preemption:
-        #     maybe_delete_earliest(get_blob_logdir())
         def save_checkpoint(rate, params):
             state_dict = self.mp_trainer.master_params_to_state_dict(params)
             if dist.get_rank() == 0:
@@ -431,3 +437,4 @@ def log_loss_dict(diffusion, ts, losses):
         for sub_t, sub_loss in zip(ts.cpu().numpy(), values.detach().cpu().numpy()):
             quartile = int(4 * sub_t / diffusion.num_timesteps)
             logger.logkv_mean(f"{key}_q{quartile}", sub_loss)
+

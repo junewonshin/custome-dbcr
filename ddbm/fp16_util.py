@@ -59,7 +59,7 @@ def model_grads_to_master_grads(param_groups_and_shapes, master_params):
     ):
         master_param.grad = _flatten_dense_tensors(
             [param_grad_or_zeros(param) for (_, param) in param_group]
-        ).view(shape)
+        ).view(shape).to(master_param.dtype)
 
 
 def master_params_to_model_params(param_groups_and_shapes, master_params):

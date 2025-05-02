@@ -27,14 +27,14 @@ def process_MS(img):                                   # 13 channel!!!!!!!!!!!!
     intensity_min, intensity_max = 0, 10000            # define a reasonable range of MS intensities
     img = np.clip(img, intensity_min, intensity_max)   # intensity clipping to a global unified MS intensity range
     img = rescale(img, intensity_min, intensity_max)   # project to [0,1], preserve global intensities (across patches), gets mapped to [-1,+1] in wrapper
-    img = np.nan_to_num(img)
-    return img[[3,2,1], :, :]
+    img = np.nan_to_num(img, nan=0.0)
+    return img
 
 def process_SAR(img):
     dB_min, dB_max = [-25.0, -32.5], [0, 0]
     img = np.concatenate([((np.clip(img[0], dB_min[0], dB_max[0]) - dB_min[0]) / (dB_max[0] - dB_min[0]))[None, ...],
                         ((np.clip(img[1], dB_min[1], dB_max[1]) - dB_min[1]) / (dB_max[1] - dB_min[1]))[None, ...]], axis=0)
-    img = np.nan_to_num(img)
+    img = np.nan_to_num(img, nan=0.0)
     return img
 
 

@@ -1,11 +1,14 @@
-"""
-Train a diffusion model on images.
-"""
-
+import os
 import argparse
+from pathlib import Path
+
+import torch as th
+import torch.distributed as dist
+from torchinfo import summary
 
 from ddbm import dist_util, logger
 from datasets import load_data
+
 from ddbm.resample import create_named_schedule_sampler
 from ddbm.script_util import (
     model_and_diffusion_defaults,
@@ -13,84 +16,65 @@ from ddbm.script_util import (
     sample_defaults,
     args_to_dict,
     add_dict_to_argparser,
-    get_workdir
+    get_workdir,
 )
 from ddbm.train_util import TrainLoop
-
-import torch.distributed as dist
-
-from pathlib import Path
-
-import wandb
-import numpy as np
-
-from glob import glob
-import os
 from datasets.augment import AugmentPipe
-def main(args):
 
+def main(args):
     workdir = get_workdir(args.exp)
     Path(workdir).mkdir(parents=True, exist_ok=True)
-    
+
     dist_util.setup_dist()
+    device = dist_util.dev()
+
     logger.configure(dir=workdir)
     if dist.get_rank() == 0:
-        name = args.exp if args.resume_checkpoint == "" else args.exp + '_resume'
-        wandb.init(project="bridge", group=args.exp,name=name, config=vars(args), mode='online' if not args.debug else 'disabled')
-        logger.log("creating model and diffusion...")
-    
+        name = args.exp if args.resume_checkpoint == "" else args.exp + "_resume"
+        logger.log(name)
 
-    data_image_size = args.image_size
-    
+    md_kwargs = args_to_dict(args, model_and_diffusion_defaults().keys())
+    model, diffusion = create_model_and_diffusion(**md_kwargs)
 
-    if args.resume_checkpoint == "":
-        model_ckpts = list(glob(f'{workdir}/*model*[0-9].*'))
-        if len(model_ckpts) > 0:
-            max_ckpt = max(model_ckpts, key=lambda x: int(x.split('model_')[-1].split('.')[0]))
-            if os.path.exists(max_ckpt):
-                args.resume_checkpoint = max_ckpt
-                if dist.get_rank() == 0:
-                    logger.log('Resuming from checkpoint: ', max_ckpt)
+    model.to(device)
+    if args.use_fp16:
+        model.half()
 
+    if hasattr(diffusion, "to"):
+        diffusion.to(device)
 
-    model, diffusion = create_model_and_diffusion(
-        **args_to_dict(args, model_and_diffusion_defaults().keys())
-    )
-    model.to(dist_util.dev())
-
-    if dist.get_rank() == 0:
-        wandb.watch(model, log='all')
     schedule_sampler = create_named_schedule_sampler(args.schedule_sampler, diffusion)
 
-    
     if args.batch_size == -1:
-        batch_size = args.global_batch_size // dist.get_world_size()
-        if args.global_batch_size % dist.get_world_size() != 0:
+        per_gpu = args.global_batch_size // dist.get_world_size()
+        if args.global_batch_size % dist.get_world_size() != 0 and dist.get_rank() == 0:
             logger.log(
-                f"warning, using smaller global_batch_size of {dist.get_world_size()*batch_size} instead of {args.global_batch_size}"
+                f"Warning: global_batch_size {args.global_batch_size} not divisible by world_size {dist.get_world_size()}, using {per_gpu*dist.get_world_size()} instead."
             )
+        batch_size = per_gpu
     else:
         batch_size = args.batch_size
-        
+
     if dist.get_rank() == 0:
-        logger.log("creating data loader...")
-    # TODO: DATALOAD
+        logger.log("Creating data loader...")
+
     data, test_data = load_data(
+        frac=args.frac,
+        seed=args.seed,
         data_dir=args.data_dir,
         dataset=args.dataset,
         batch_size=batch_size,
-        image_size=data_image_size,
         num_workers=args.num_workers,
     )
-    
+
+    augment = None
     if args.use_augment:
         augment = AugmentPipe(
-                p=0.12,xflip=1e8, yflip=1, scale=1, rotate_frac=1, aniso=1, translate_frac=1
-            )
-    else:
-        augment = None
-        
-    logger.log("training...")
+            p=0.12, xflip=1e8, yflip=1, scale=1, rotate_frac=1, aniso=1, translate_frac=1
+        )
+
+    # 6) 학습 루프 실행
+    logger.log("Training...")
     TrainLoop(
         model=model,
         diffusion=diffusion,
@@ -111,40 +95,44 @@ def main(args):
         schedule_sampler=schedule_sampler,
         weight_decay=args.weight_decay,
         lr_anneal_steps=args.lr_anneal_steps,
+        total_training_steps=args.total_training_steps,
         augment_pipe=augment,
-        **sample_defaults()
+        **sample_defaults(),
     ).run_loop()
-
+    if dist.get_rank() == 0:
+        logger.log("Training complete.")
 
 def create_argparser():
     defaults = dict(
-        data_dir="",
-        dataset='edges2handbags',
+        data_dir="/home/work/dataset/SEN12MSCR",
+        dataset="sen12mscr",
         schedule_sampler="uniform",
-        lr=1e-4,
+        frac=0.1,
+        seed=42,
+        lr=1e-5,
         weight_decay=0.0,
         lr_anneal_steps=0,
-        global_batch_size=2048,
-        batch_size=-1,
-        microbatch=-1,      # -1 disables microbatches
-        ema_rate="0.9999",  # comma-separated list of EMA values
+        total_training_steps=285125, # 10000000
+        global_batch_size=1,
+        batch_size=4,                 # 40 -> 4 -> 8 x -> B * 23(image) * 256 * 256 -> 128 * 128
+        microbatch=1,
+        ema_rate="0.9999",
         log_interval=50,
-        test_interval=500,
+        test_interval=1000,
         save_interval=10000,
         save_interval_for_preemption=50000,
         resume_checkpoint="",
-        exp='',
+        exp="",
         use_fp16=False,
         fp16_scale_growth=1e-3,
         debug=False,
-        num_workers=2,
-        use_augment=False
+        num_workers=16,
+        use_augment=False,
     )
     defaults.update(model_and_diffusion_defaults())
     parser = argparse.ArgumentParser()
     add_dict_to_argparser(parser, defaults)
     return parser
-
 
 if __name__ == "__main__":
     args = create_argparser().parse_args()

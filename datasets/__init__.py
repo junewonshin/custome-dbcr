@@ -10,12 +10,11 @@ from tqdm import tqdm
 # import imageio
 
 import math
-import random
 import torch.distributed as dist
 
 from torch.utils.data.sampler import Sampler
 
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 
 
 def get_data_scaler(config):
@@ -39,7 +38,6 @@ def get_data_inverse_scaler(config):
 class UniformDequant(object):
   def __call__(self, x):
     return x + torch.rand_like(x) / 256
-
 
 
 
@@ -271,56 +269,64 @@ class DistInfiniteBatchSampler(InfiniteBatchSampler):
   
 
 
-
 def load_data(
+    frac,
+    seed,
     data_dir,
     dataset,
     batch_size,
     include_test=False,
-    num_workers=2,
+    num_workers=16,
 ):
     root_dir = data_dir
 
-    if dataset == 'sen12mscr':
-        from .sen12_dataset import SEN12MSCR
-    
-    trainset   = SEN12MSCR(root=root_dir, split='train')
-    valset     = SEN12MSCR(root=root_dir, split='val')
+    shuffle_gen = torch.Generator().manual_seed(seed)
+
+    from .sen12_dataset import SEN12MSCR
+    trainset = SEN12MSCR(root=root_dir, split='train')
+    valset   = SEN12MSCR(root=root_dir, split='val')
+
+    N = len(trainset)
+    subset_size = max(1, int(frac * N))
+    idx = torch.randperm(N, generator=torch.Generator().manual_seed(seed))
+    subset_indices = idx[:subset_size].tolist()
+    trainset = Subset(trainset, subset_indices)
 
     def collate_fn(batch):
-
-        sar = torch.stack([item['input']['S1'] for item in batch], dim=0)
-        opt = torch.stack([item['input']['S2'] for item in batch], dim=0)
+        sar    = torch.stack([item['input']['S1']  for item in batch], dim=0)
+        opt    = torch.stack([item['input']['S2']  for item in batch], dim=0)
         target = torch.stack([item['target']['S2'] for item in batch], dim=0)
         return (opt, sar), target
 
-
     train_loader = DataLoader(
-       dataset=trainset, 
-       batch_size=batch_size, 
-       num_workers=num_workers, 
-       pin_memory=True,
-       collate_fn=collate_fn,
-       shuffle=True,
+        dataset=trainset,
+        batch_size=batch_size,
+        shuffle=True,
+        generator=shuffle_gen,
+        num_workers=num_workers,
+        pin_memory=True,
+        collate_fn=collate_fn,
     )
 
     val_loader = DataLoader(
-       dataset=valset, 
-       batch_size=batch_size,
-       num_workers=num_workers, 
-       pin_memory=True,
-       collate_fn=collate_fn,
-       shuffle=False,
+        dataset=valset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        collate_fn=collate_fn,
     )
-    
+
     if include_test:
         testset = SEN12MSCR(root=root_dir, split='test')
         test_loader = DataLoader(
-            testset,
+            dataset=testset,
             batch_size=batch_size,
-            num_workers=num_workers,
             shuffle=False,
+            num_workers=num_workers,
+            pin_memory=True,
             collate_fn=collate_fn,
         )
         return train_loader, val_loader, test_loader
+
     return train_loader, val_loader
