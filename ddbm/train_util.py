@@ -225,8 +225,8 @@ class TrainLoop:
                     
                 took_step = self.run_step(batch, cond)
                 if self.step % self.log_interval == 0:
-                    logs = logger.dumpkvs()     
-                                                      
+                    logger.dumpkvs()     
+
                 if self.step % self.test_interval == 0:
                     (test_opt, test_sar), test_target = next(iter(self.test_data))
                     test_target = self.preprocess(test_target)
